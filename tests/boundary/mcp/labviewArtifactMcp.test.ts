@@ -5,7 +5,11 @@ import { describe, expect, it, onTestFinished } from "vitest";
 import { silentLogger } from "../../../src/logger.js";
 import { createServer } from "../../../src/server/createServer.js";
 import { createTestBinarySession } from "../../fixtures/binarySession.js";
-import { buildLabviewRsrc } from "../../fixtures/labview/rsrc.js";
+import {
+  buildLabviewRsrc,
+  labviewXor8320,
+  labviewZipArchive,
+} from "../../fixtures/labview/rsrc.js";
 import { createMcpSchemaValidation } from "../../fixtures/mcpSchemaValidation.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
@@ -151,5 +155,66 @@ describe("inspect_labview_artifact delivery", () => {
       "DFDS",
       "LIvi",
     ]);
+  });
+
+  it("summarizes and pages the embedded program tree from retained Evidence", async () => {
+    const dir = await createTestTempDirectory("rea-labview-tree-mcp-");
+    const path = join(dir, "tree.vi");
+    await writeFile(
+      path,
+      buildLabviewRsrc([
+        {
+          ident: "LVzp",
+          sections: [
+            labviewXor8320(
+              labviewZipArchive([
+                { name: "a.vi", content: Buffer.from("1") },
+                { name: "b/c.vi", content: Buffer.from("22") },
+              ]),
+            ),
+          ],
+        },
+      ]),
+    );
+    const client = await connect();
+
+    const summaryRes = await client.callTool({
+      name: "inspect_labview_artifact",
+      arguments: { path, detail: "summary" },
+    });
+    expect(summaryRes.isError).not.toBe(true);
+    const summary = summaryRes.structuredContent as {
+      evidence_links: string[];
+      normalized_result: Record<string, unknown>;
+    };
+    expect(summary.normalized_result).toMatchObject({
+      summary: {
+        program_tree_listed: true,
+        program_tree_entry_count: 2,
+        program_tree_total_bytes: 3,
+      },
+    });
+    const parentId = summary.evidence_links[0];
+
+    const pageRes = await client.callTool({
+      name: "inspect_analysis_view",
+      arguments: {
+        source: { kind: "retained-evidence", evidence_id: parentId },
+        view: {
+          kind: "labview-artifact",
+          collection: "program_tree",
+          offset: 1,
+          limit: 1,
+        },
+      },
+    });
+    expect(pageRes.isError).not.toBe(true);
+    expect(
+      (pageRes.structuredContent as { normalized_result: unknown })
+        .normalized_result,
+    ).toMatchObject({
+      items: [{ name: "b/c.vi", bytes: 2, source_index: 1 }],
+      coverage: { total: 2 },
+    });
   });
 });

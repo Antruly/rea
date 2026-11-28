@@ -1,4 +1,4 @@
-import { deflateSync } from "node:zlib";
+import { crc32, deflateSync } from "node:zlib";
 
 export interface BlockFixture {
   readonly ident: string;
@@ -137,3 +137,88 @@ export const labviewContainer = (): Buffer =>
       sections: [labviewZlibSection("hello"), Buffer.from("raw!")],
     },
   ]);
+
+/** Encrypt bytes with pylabview's xor8320 stream (the inverse of its decrypt). */
+export const labviewXor8320 = (data: Buffer): Buffer => {
+  const out = Buffer.allocUnsafe(data.length);
+  let key = 0xed_b8_83_20;
+  for (let index = 0; index < data.length; index += 1) {
+    const value = data[index] ?? 0;
+    out[index] = (key ^ value) & 0xff;
+    key = (value ^ ((key << 1) | (key >>> 31))) >>> 0;
+  }
+  return out;
+};
+
+export interface ZipMemberFixture {
+  readonly name: string;
+  readonly content: Buffer;
+  readonly utf8?: boolean;
+  readonly encrypted?: boolean;
+  readonly extra?: Buffer;
+}
+
+/** Build a stored-method ZIP archive with the given file members. */
+export const labviewZipArchive = (
+  members: readonly ZipMemberFixture[],
+): Buffer => {
+  const locals: Buffer[] = [];
+  const central: Buffer[] = [];
+  let offset = 0;
+  for (const member of members) {
+    const name = Buffer.from(
+      member.name,
+      member.utf8 === true ? "utf8" : "latin1",
+    );
+    const extra = member.extra ?? Buffer.alloc(0);
+    const flags =
+      (member.utf8 === true ? 0x08_00 : 0) |
+      (member.encrypted === true ? 0x00_01 : 0);
+    const checksum = crc32(member.content) >>> 0;
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04_03_4b_50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(flags, 6);
+    local.writeUInt16LE(0, 8);
+    local.writeUInt32LE(0, 10);
+    local.writeUInt32LE(checksum, 14);
+    local.writeUInt32LE(member.content.length, 18);
+    local.writeUInt32LE(member.content.length, 22);
+    local.writeUInt16LE(name.length, 26);
+    local.writeUInt16LE(extra.length, 28);
+    const localBytes = Buffer.concat([local, name, extra, member.content]);
+    locals.push(localBytes);
+
+    const entry = Buffer.alloc(46);
+    entry.writeUInt32LE(0x02_01_4b_50, 0);
+    entry.writeUInt16LE(20, 4);
+    entry.writeUInt16LE(20, 6);
+    entry.writeUInt16LE(flags, 8);
+    entry.writeUInt16LE(0, 10);
+    entry.writeUInt32LE(0, 12);
+    entry.writeUInt32LE(checksum, 16);
+    entry.writeUInt32LE(member.content.length, 20);
+    entry.writeUInt32LE(member.content.length, 24);
+    entry.writeUInt16LE(name.length, 28);
+    entry.writeUInt16LE(extra.length, 30);
+    entry.writeUInt16LE(0, 32);
+    entry.writeUInt16LE(0, 34);
+    entry.writeUInt16LE(0, 36);
+    entry.writeUInt32LE(0, 38);
+    entry.writeUInt32LE(offset, 42);
+    central.push(Buffer.concat([entry, name, extra]));
+    offset += localBytes.length;
+  }
+  const localPart = Buffer.concat(locals);
+  const centralPart = Buffer.concat(central);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06_05_4b_50, 0);
+  end.writeUInt16LE(0, 4);
+  end.writeUInt16LE(0, 6);
+  end.writeUInt16LE(members.length, 8);
+  end.writeUInt16LE(members.length, 10);
+  end.writeUInt32LE(centralPart.length, 12);
+  end.writeUInt32LE(localPart.length, 16);
+  end.writeUInt16LE(0, 20);
+  return Buffer.concat([localPart, centralPart, end]);
+};

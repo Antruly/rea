@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   labviewArtifactSchema,
+  labviewProgramTreeMemberSchema,
   labviewSectionSchema,
 } from "../labview/labviewArtifact.js";
 import { ok } from "../result.js";
@@ -21,7 +22,7 @@ import { selectViewRows } from "./selectViewRows.js";
 
 export const labviewArtifactViewRequestSchema = z.strictObject({
   kind: z.literal("labview-artifact"),
-  collection: z.enum(["blocks", "sections"]),
+  collection: z.enum(["blocks", "sections", "program_tree"]),
   block: z
     .string()
     .length(4)
@@ -51,6 +52,11 @@ export const labviewArtifactViewItemsSchema = z.union([
       ...sourceIndex,
     }),
   ),
+  z.array(
+    labviewProgramTreeMemberSchema.extend({
+      ...sourceIndex,
+    }),
+  ),
 ]);
 
 const {
@@ -71,6 +77,9 @@ const context = {
   front_panel,
   block_count: count,
   section_count: count,
+  program_tree_listed: z.boolean(),
+  program_tree_entry_count: count,
+  program_tree_total_bytes: count,
 };
 
 export const labviewArtifactSummarySchema = z.strictObject(context);
@@ -151,6 +160,9 @@ export const projectLabviewArtifactView = (
     front_panel: r.front_panel,
     block_count: r.blocks.length,
     section_count: index.blockOf.length,
+    program_tree_listed: r.program_tree !== null,
+    program_tree_entry_count: r.program_tree?.entry_count ?? 0,
+    program_tree_total_bytes: r.program_tree?.total_bytes ?? 0,
   };
   const shared = {
     parent_evidence_id: parent.evidenceId,
@@ -184,7 +196,14 @@ export const projectLabviewArtifactView = (
             source_index,
           }),
         )
-      : selectSections(r, index, view);
+      : view.collection === "sections"
+        ? selectSections(r, index, view)
+        : selectViewRows(
+            r.program_tree?.members ?? [],
+            view,
+            undefined,
+            (member, source_index) => ({ ...member, source_index }),
+          );
 
   return ok({
     ...shared,

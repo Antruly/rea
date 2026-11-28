@@ -59,11 +59,17 @@ export interface LabviewRsrc {
   readonly versionCoverage: LabviewVersionCoverage;
   /** Whether the container carries an embedded program tree (`LVzp`). */
   readonly programTree: boolean;
+  /** Every decoded program-tree archive; a later one may still be readable. */
+  readonly programTreeArchives: readonly Uint8Array[];
   readonly blockDiagram: LabviewPresence;
   readonly frontPanel: LabviewPresence;
   readonly blocks: readonly LabviewBlock[];
   /** Recognized zlib sections left undecoded, counted by reason. */
   readonly decodeOmissions: Readonly<
+    Partial<Record<LabviewDecodeOmission, number>>
+  >;
+  /** The largest size each allowance stopped, so the report can name it. */
+  readonly decodeOmissionRequired: Readonly<
     Partial<Record<LabviewDecodeOmission, number>>
   >;
 }
@@ -72,6 +78,7 @@ export interface LabviewRsrc {
 export const LABVIEW_DECODE_ALLOWANCES = {
   compressed_allowance: MAX_COMPRESSED_BYTES,
   decoded_allowance: MAX_DECODED_BYTES,
+  program_tree_allowance: MAX_DECODED_BYTES,
 } as const;
 
 export type LabviewParseResult =
@@ -111,12 +118,43 @@ const zlibHeader = (
     ? { presetDictionary: (flg & ZLIB_FDICT) !== 0 }
     : undefined;
 
+const ZIP_LOCAL_MAGIC = 0x04_03_4b_50;
+const ZIP_END_MAGIC = 0x06_05_4b_50;
+
+/** Whether the bytes open a ZIP archive (a local header or an empty archive). */
+const isZipArchive = (bytes: Uint8Array): boolean => {
+  if (bytes.length < 4) return false;
+  const magic =
+    ((bytes[0] ?? 0) |
+      ((bytes[1] ?? 0) << 8) |
+      ((bytes[2] ?? 0) << 16) |
+      ((bytes[3] ?? 0) << 24)) >>>
+    0;
+  return magic === ZIP_LOCAL_MAGIC || magic === ZIP_END_MAGIC;
+};
+
+/**
+ * Decrypt pylabview's `xor8320` stream: each byte is the key's low byte, then
+ * the CRC32 polynomial key rotates left once per byte.
+ */
+const xor8320 = (data: Uint8Array): Buffer => {
+  const out = Buffer.allocUnsafe(data.length);
+  let key = 0xed_b8_83_20;
+  for (let index = 0; index < data.length; index += 1) {
+    const value = (key ^ (data[index] ?? 0)) & 0xff;
+    out[index] = value;
+    key = (value ^ ((key << 1) | (key >>> 31))) >>> 0;
+  }
+  return out;
+};
+
 /** Why a recognized zlib section was not decoded. */
 export type LabviewDecodeOmission =
   | "preset_dictionary"
   | "compressed_allowance"
   | "decoded_allowance"
-  | "inflate_failed";
+  | "inflate_failed"
+  | "program_tree_allowance";
 
 interface DecodeBudget {
   decodedRemaining: number;
@@ -127,6 +165,8 @@ interface SectionDecoding {
   readonly coding: LabviewCoding;
   /** Set when a recognized zlib section was not decoded, with the reason. */
   readonly omission?: LabviewDecodeOmission;
+  /** Bytes the omitted content needed, when its allowance stopped it. */
+  readonly requiredBytes?: number;
   readonly decodedBytes: number | null;
   /** The decoded payload, kept only for blocks whose content is read back. */
   readonly decoded: Buffer | undefined;
@@ -146,17 +186,34 @@ const decodeSection = (
 ): SectionDecoding => {
   const cached = cache.get(cacheKey);
   if (cached !== undefined) return cached;
-  const unknown = (omission: LabviewDecodeOmission): SectionDecoding => ({
+  const unknown = (
+    omission: LabviewDecodeOmission,
+    requiredBytes?: number,
+  ): SectionDecoding => ({
     coding: "unknown",
     omission,
+    ...(requiredBytes === undefined ? {} : { requiredBytes }),
     decodedBytes: null,
     decoded: undefined,
   });
   const result = (): SectionDecoding => {
-    // LVzp (the embedded program tree) is XOR-coded, not compressed, and this
-    // reader inventories it without materializing its payload.
-    if (blockIdentifier === "LVzp")
-      return { coding: "xor", decodedBytes: null, decoded: undefined };
+    if (blockIdentifier === "LVzp") {
+      // The embedded program tree is a ZIP archive of the project's VIs. Older
+      // versions store it plain; newer ones transform it with xor8320.
+      if (isZipArchive(stored)) {
+        if (stored.length > budget.decodedRemaining)
+          return unknown("program_tree_allowance", stored.length);
+        budget.decodedRemaining -= stored.length;
+        return { coding: "none", decodedBytes: stored.length, decoded: stored };
+      }
+      if (stored.length > budget.decodedRemaining)
+        return unknown("program_tree_allowance");
+      budget.decodedRemaining -= stored.length;
+      const decoded = xor8320(stored);
+      return isZipArchive(decoded)
+        ? { coding: "xor", decodedBytes: decoded.length, decoded }
+        : { coding: "xor", decodedBytes: decoded.length, decoded: undefined };
+    }
     if (stored.length < 6)
       return { coding: "none", decodedBytes: null, decoded: undefined };
     const head = new BinaryReader(stored, false, FORMAT);
@@ -369,12 +426,16 @@ export const parseLabviewRsrc = (
     const blocks: LabviewBlock[] = [];
     const versionSections: Uint8Array[] = [];
     let sawVersionSection = false;
+    const programTreeArchives: Uint8Array[] = [];
     const budget: DecodeBudget = {
       decodedRemaining: MAX_DECODED_BYTES,
       inputRemaining: MAX_COMPRESSED_BYTES,
     };
     const decodedSections = new Map<string, SectionDecoding>();
     const decodeOmissions: Partial<Record<LabviewDecodeOmission, number>> = {};
+    const decodeOmissionRequired: Partial<
+      Record<LabviewDecodeOmission, number>
+    > = {};
     // First pass: validate every block's start table and locate the one name
     // list that all section-name offsets address, after every start table.
     let totalSections = 0;
@@ -468,9 +529,18 @@ export const parseLabviewRsrc = (
           `${identifier}:${String(sectionOffset)}`,
           decodedSections,
         );
-        if (decoded.omission !== undefined)
+        if (decoded.omission !== undefined) {
           decodeOmissions[decoded.omission] =
             (decodeOmissions[decoded.omission] ?? 0) + 1;
+          if (decoded.requiredBytes !== undefined)
+            decodeOmissionRequired[decoded.omission] = Math.max(
+              decodeOmissionRequired[decoded.omission] ?? 0,
+              decoded.requiredBytes,
+            );
+        }
+        // A damaged-looking archive must not hide a readable later section.
+        if (identifier === "LVzp" && decoded.decoded !== undefined)
+          programTreeArchives.push(decoded.decoded);
         // Only content this reader actually read can report a version: a
         // failed or skipped decode leaves compressed bytes that can contain
         // digit-like binary values.
@@ -522,8 +592,10 @@ export const parseLabviewRsrc = (
         blockDiagram,
         frontPanel,
         programTree,
+        programTreeArchives,
         blocks,
         decodeOmissions,
+        decodeOmissionRequired,
       },
     };
   } catch (cause) {
